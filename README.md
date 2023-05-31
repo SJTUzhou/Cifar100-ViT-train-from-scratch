@@ -1,6 +1,6 @@
 # ViT-CIFAR
 
-
+Modified version of Repo https://github.com/omihub777/ViT-CIFAR
 
 ## 1. Quick Start
 
@@ -84,4 +84,4 @@ python main.py --autoaugment --label-smoothing --mixup --max-epoch 1000 --num-la
 
 
 ## 4. Ref.
-* Repo: 
+* Repo: https://github.com/omihub777/ViT-CIFAR
