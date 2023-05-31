@@ -1,35 +1,24 @@
 import argparse
 
-import comet_ml
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision
-import pytorch_lightning as pl
-import warmup_scheduler
-import numpy as np
-
-from utils import get_model, get_dataset, get_experiment_name, get_criterion
-from da import CutMix, MixUp
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--api-key", help="API Key for Comet.ml")
-parser.add_argument("--dataset", default="c10", type=str, help="[c10, c100, svhn]")
-parser.add_argument("--num-classes", default=10, type=int)
+parser.add_argument("--gpu-id", default="all", help="[all,0,1,...,7]", type=str)
+parser.add_argument("--dataset", default="c100", type=str, help="[c10, c100, svhn, imagenet]")
 parser.add_argument("--model-name", default="vit", help="[vit]", type=str)
 parser.add_argument("--patch", default=8, type=int)
-parser.add_argument("--batch-size", default=128, type=int)
+parser.add_argument("--batch-size", default=256, type=int)
 parser.add_argument("--eval-batch-size", default=1024, type=int)
 parser.add_argument("--lr", default=1e-3, type=float)
 parser.add_argument("--min-lr", default=1e-5, type=float)
 parser.add_argument("--beta1", default=0.9, type=float)
 parser.add_argument("--beta2", default=0.999, type=float)
 parser.add_argument("--off-benchmark", action="store_true")
-parser.add_argument("--max-epochs", default=200, type=int)
+parser.add_argument("--max-epochs", default=1000, type=int)
 parser.add_argument("--dry-run", action="store_true")
-parser.add_argument("--weight-decay", default=5e-5, type=float)
-parser.add_argument("--warmup-epoch", default=5, type=int)
-parser.add_argument("--precision", default=16, type=int)
+parser.add_argument("--weight-decay", default=1e-2, type=float) # 5e-5 for adam, 1e-2 for adamw
+parser.add_argument("--warmup-epoch", default=10, type=int)
+parser.add_argument("--precision", default='bf16-mixed', type=str, help="Double precision (64, '64' or '64-true'), full precision (32, '32' or '32-true'),\
+                16bit mixed precision (16, '16', '16-mixed') or bfloat16 mixed precision ('bf16', 'bf16-mixed')")
 parser.add_argument("--autoaugment", action="store_true")
 parser.add_argument("--criterion", default="ce")
 parser.add_argument("--label-smoothing", action="store_true")
@@ -37,30 +26,48 @@ parser.add_argument("--smoothing", default=0.1, type=float)
 parser.add_argument("--rcpaste", action="store_true")
 parser.add_argument("--cutmix", action="store_true")
 parser.add_argument("--mixup", action="store_true")
-parser.add_argument("--dropout", default=0.0, type=float)
+parser.add_argument("--dropout", default=0.1, type=float)
 parser.add_argument("--head", default=12, type=int)
 parser.add_argument("--num-layers", default=7, type=int)
 parser.add_argument("--hidden", default=384, type=int)
-parser.add_argument("--mlp-hidden", default=384, type=int)
+parser.add_argument("--mlp-hidden", default=768, type=int)
 parser.add_argument("--off-cls-token", action="store_true")
 parser.add_argument("--seed", default=42, type=int)
+parser.add_argument("--num-workers", default=8, type=int)
 parser.add_argument("--project-name", default="VisionTransformer")
 args = parser.parse_args()
+
+###############
+### Example ###
+###############
+
+# python main.py --autoaugment --label-smoothing --mixup --max-epoch 1000 --num-layers 7 --head 12 --hidden 384 --dropout 0.1 --dataset c100 --patch 8 --mlp-hidden 768 --warmup-epoch 10 --weight-decay 0.01 --seed 42 --batch-size 256 --gpu-id 0
+
+import os
+if args.gpu_id != "all":
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
+
+
+import torch
+torch.set_float32_matmul_precision("medium")
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision
+import pytorch_lightning as pl
+import warmup_scheduler
+import numpy as np
+from utils import get_model, get_dataset, get_experiment_name, get_criterion, save_config_file
+from da import CutMix, MixUp
+
+
 torch.manual_seed(args.seed)
 np.random.seed(args.seed)
 args.benchmark = True if not args.off_benchmark else False
 args.gpus = torch.cuda.device_count()
-args.num_workers = 4*args.gpus if args.gpus else 8
 args.is_cls_token = True if not args.off_cls_token else False
-if not args.gpus:
-    args.precision=32
 
-if args.mlp_hidden != args.hidden*4:
-    print(f"[INFO] In original paper, mlp_hidden(CURRENT:{args.mlp_hidden}) is set to: {args.hidden*4}(={args.hidden}*4)")
 
-train_ds, test_ds = get_dataset(args)
-train_dl = torch.utils.data.DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=True)
-test_dl = torch.utils.data.DataLoader(test_ds, batch_size=args.eval_batch_size, num_workers=args.num_workers, pin_memory=True)
+
 
 class Net(pl.LightningModule):
     def __init__(self, hparams):
@@ -72,17 +79,21 @@ class Net(pl.LightningModule):
         if hparams.cutmix:
             self.cutmix = CutMix(hparams.size, beta=1.)
         if hparams.mixup:
-            self.mixup = MixUp(alpha=1.)
-        self.log_image_flag = hparams.api_key is None
+            self.mixup = MixUp(alpha=0.8) # [heavy2] in How to train your ViT?
+        self.log_image_flag = True
+        
 
     def forward(self, x):
         return self.model(x)
 
     def configure_optimizers(self):
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.hparams.lr, betas=(self.hparams.beta1, self.hparams.beta2), weight_decay=self.hparams.weight_decay)
+        # self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.hparams.lr, betas=(self.hparams.beta1, self.hparams.beta2), weight_decay=self.hparams.weight_decay)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.hparams.lr, betas=(self.hparams.beta1, self.hparams.beta2), weight_decay=self.hparams.weight_decay)
         self.base_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=self.hparams.max_epochs, eta_min=self.hparams.min_lr)
         self.scheduler = warmup_scheduler.GradualWarmupScheduler(self.optimizer, multiplier=1., total_epoch=self.hparams.warmup_epoch, after_scheduler=self.base_scheduler)
         return [self.optimizer], [self.scheduler]
+        
+
 
     def training_step(self, batch, batch_idx):
         img, label = batch
@@ -109,16 +120,18 @@ class Net(pl.LightningModule):
         self.log("acc", acc)
         return loss
 
-    def training_epoch_end(self, outputs):
-        self.log("lr", self.optimizer.param_groups[0]["lr"], on_epoch=self.current_epoch)
+
+    # pytorch_lightning 2.0.0
+    def on_training_epoch_end(self, outputs):
+        self.log("lr", self.optimizer.param_groups[0]["lr"], on_epoch=self.current_epoch, sync_dist=True)
 
     def validation_step(self, batch, batch_idx):
         img, label = batch
         out = self(img)
         loss = self.criterion(out, label)
         acc = torch.eq(out.argmax(-1), label).float().mean()
-        self.log("val_loss", loss)
-        self.log("val_acc", acc)
+        self.log("val_loss", loss, sync_dist=True)
+        self.log("val_acc", acc, sync_dist=True)
         return loss
 
     def _log_image(self, image):
@@ -128,29 +141,36 @@ class Net(pl.LightningModule):
 
 
 if __name__ == "__main__":
+
+    train_ds, test_ds = get_dataset(args)
+    pin_memory = False if args.dataset=="imagenet" else True
+    train_dl = torch.utils.data.DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, pin_memory=pin_memory)
+    test_dl = torch.utils.data.DataLoader(test_ds, batch_size=args.eval_batch_size, num_workers=args.num_workers, pin_memory=pin_memory)
+
     experiment_name = get_experiment_name(args)
-    print(experiment_name)
-    if args.api_key:
-        print("[INFO] Log with Comet.ml!")
-        logger = pl.loggers.CometLogger(
-            api_key=args.api_key,
-            save_dir="logs",
-            project_name=args.project_name,
-            experiment_name=experiment_name
-        )
-        refresh_rate = 0
-    else:
-        print("[INFO] Log with CSV")
-        logger = pl.loggers.CSVLogger(
-            save_dir="logs",
-            name=experiment_name
-        )
-        refresh_rate = 1
+    # Create a TensorBoardLogger to log metrics
+    print("[INFO] Log with TensorBoardLogger")
+    logger = pl.loggers.TensorBoardLogger('logs/', name=experiment_name)
+    refresh_rate = 1
+        
+    
     net = Net(args)
-    trainer = pl.Trainer(precision=args.precision,fast_dev_run=args.dry_run, gpus=args.gpus, benchmark=args.benchmark, logger=logger, max_epochs=args.max_epochs, weights_summary="full", progress_bar_refresh_rate=refresh_rate)
-    trainer.fit(model=net, train_dataloader=train_dl, val_dataloaders=test_dl)
+    
+
+    # pytorch-lightning == 2.0.2
+    ckpt_cb = pl.callbacks.ModelCheckpoint(dirpath=os.path.join(logger.log_dir,'ckpt'), monitor="val_loss", mode="min", save_top_k=2, 
+                                           save_last=True, filename="{epoch}-{val_loss:.4f}-{val_acc:.4f}", every_n_epochs=1)
+    
+    trainer = pl.Trainer(precision=args.precision, fast_dev_run=args.dry_run, num_nodes=1, devices=args.gpus, 
+                        benchmark=args.benchmark, logger=logger, max_epochs=args.max_epochs, callbacks=[ckpt_cb],
+                        enable_model_summary=True, enable_progress_bar=True, log_every_n_steps=50, 
+                        accelerator="gpu", strategy="ddp", enable_checkpointing=True)
+    
+    save_config_file(logger.log_dir, args)
+    print("log dir: ", logger.log_dir)
+    
+    trainer.fit(model=net, train_dataloaders=train_dl, val_dataloaders=test_dl)
+    
     if not args.dry_run:
         model_path = f"weights/{experiment_name}.pth"
         torch.save(net.state_dict(), model_path)
-        if args.api_key:
-            logger.experiment.log_asset(file_name=experiment_name, file_data=model_path)

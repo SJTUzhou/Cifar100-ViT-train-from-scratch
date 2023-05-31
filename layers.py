@@ -8,6 +8,9 @@ class TransformerEncoder(nn.Module):
     def __init__(self, feats:int, mlp_hidden:int, head:int=8, dropout:float=0.):
         super(TransformerEncoder, self).__init__()
         self.la1 = nn.LayerNorm(feats)
+
+        self.msa = None
+        attn_type = attn_type.lower()
         self.msa = MultiHeadSelfAttention(feats, head=head, dropout=dropout)
         self.la2 = nn.LayerNorm(feats)
         self.mlp = nn.Sequential(
@@ -45,19 +48,14 @@ class MultiHeadSelfAttention(nn.Module):
         k = self.k(x).view(b, n, self.head, self.feats//self.head).transpose(1,2)
         v = self.v(x).view(b, n, self.head, self.feats//self.head).transpose(1,2)
 
-        score = F.softmax(torch.einsum("bhif, bhjf->bhij", q, k)/self.sqrt_d, dim=-1) #(b,h,n,n)
-        attn = torch.einsum("bhij, bhjf->bihf", score, v) #(b,n,h,f//h)
-        o = self.dropout(self.o(attn.flatten(2)))
+        attn_prob = F.softmax(torch.einsum("bhif, bhjf->bhij", q, k)/self.sqrt_d, dim=-1) #(b,h,n,n)
+        attn_prob = self.dropout(attn_prob)
+        attn = torch.einsum("bhij, bhjf->bihf", attn_prob, v) #(b,n,h,f//h)
+        o = self.o(attn.flatten(2))
         return o
 
-class MultiHeadDepthwiseSelfAttention(nn.Module):
-    def __init__(self, feats:int, head:int=8, dropout:float=0):
-        super(MultiHeadDepthwiseSelfAttention, self).__init__()
-        ...
 
-    def forward(self, x):
-        
-        ...
+
 
 if __name__=="__main__":
     b,n,f = 4, 16, 128
