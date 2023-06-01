@@ -10,7 +10,7 @@ Modified version of Repo https://github.com/omihub777/ViT-CIFAR
 conda create -n torch2 python=3.10
 conda activate torch2
 conda install pytorch torchvision torchaudio pytorch-cuda=11.7 -c pytorch -c nvidia
-pip install pytorch_lightning==2.0.2, torch_summary, tensorboard==2.13.0
+pip install pytorch_lightning==2.0.2 torch_summary tensorboard==2.13.0
 ```
 
 2. **Train ViT on CIFAR-100**
